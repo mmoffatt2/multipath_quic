@@ -1,61 +1,114 @@
-import asyncio, time, json, os
+#!/usr/bin/env python3
+import asyncio
+import json
+import os
+import time
+
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.asyncio import serve
+from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.quic.events import (
+    QuicEvent,
+    StreamDataReceived,
+    ProtocolNegotiated,
+    HandshakeCompleted,
+)
 
-log = []
-current_sched = "unknown"
+LOG = []
+CURRENT_SCHED = "unknown"
 
-async def handle_stream(reader, writer):
-    global log, current_sched
 
-    # Read possible scheduler header
-    first = await reader.read(200)
-    if first.startswith(b"SCHED:"):
-        current_sched = first.decode().split(":",1)[1].strip()
-        print(f"*** Detected scheduler: {current_sched}")
-    else:
-        log.append({"timestamp": time.time(), "size": len(first)})
+class MPQuicProtocol(QuicConnectionProtocol):
+    """
+    Server-side QUIC protocol:
+    - Logs RTT-related fields after handshake
+    - Detects scheduler header (SCHED:xxx)
+    - Logs incoming data sizes
+    - Echoes data back to client (so client receives ACKS)
+    """
 
-    while True:
-        data = await reader.read(1200)
-        if not data:
-            break
+    def __init__(self, *args, **kwargs):
+        self._printed_loss_attrs = False
+        super().__init__(*args, **kwargs)
 
-        log.append({
-            "timestamp": time.time(),
-            "size": len(data)
-        })
+    def quic_event_received(self, event: QuicEvent) -> None:
+        global CURRENT_SCHED, LOG
 
-        writer.write(b"ack")
-        await writer.drain()
+        print("GOT EVENT:", event)
+        super().quic_event_received(event)
+
+        # ---- RTT diagnostics after handshake ----
+        if isinstance(event, HandshakeCompleted) and not self._printed_loss_attrs:
+            self._printed_loss_attrs = True
+            loss = self._quic._loss
+
+            print("LOSS ATTRS WITH 'rtt' IN NAME:")
+            for name in dir(loss):
+                if "rtt" in name.lower():
+                    print("   ", name, "=", getattr(loss, name))
+
+        # ---- Handle incoming stream data ----
+        if isinstance(event, StreamDataReceived):
+            data = event.data
+            sid = event.stream_id
+
+            # Detect scheduler header
+            if data.startswith(b"SCHED:"):
+                print("*** Raw scheduler header:", data[:150], "...")
+                try:
+                    CURRENT_SCHED = data.decode(errors="ignore").split(":", 1)[1].strip()
+                except Exception:
+                    CURRENT_SCHED = "unknown"
+                print(f"*** Scheduler detected: {CURRENT_SCHED}")
+
+            else:
+                # Log payload size
+                LOG.append({
+                    "timestamp": time.time(),
+                    "stream_id": sid,
+                    "size": len(data),
+                })
+
+            # IMPORTANT: echo data back (client uses ACKs for RTT)
+            self._quic.send_stream_data(sid, b"ACK", end_stream=False)
+            self.transmit()
+
 
 async def main():
-    conf = QuicConfiguration(is_client=False)
+    conf = QuicConfiguration(
+        is_client=False,
+        alpn_protocols=["hq-29"],
+    )
+
     conf.load_cert_chain("cert.pem", "key.pem")
 
-    print("*** QUIC server running on port 4443")
-    server = await serve(
+    print("*** Starting QUIC server on 0.0.0.0:4443")
+
+    # 🔥 Correct: use our custom protocol
+    await serve(
         host="0.0.0.0",
         port=4443,
         configuration=conf,
-        stream_handler=handle_stream
+        create_protocol=MPQuicProtocol,
     )
 
-    # ✅ Keep server running until Ctrl+C
+    # Keep running until Ctrl+C
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:
         pass
 
-    # ✅ Save logs on shutdown
-    sched = current_sched if current_sched else "unknown"
-    log_dir = f"runs/{sched}"
+    # ---- Save logs ----
+    sched = CURRENT_SCHED or "unknown"
+    log_dir = os.path.join("runs", sched)
     os.makedirs(log_dir, exist_ok=True)
 
-    with open(f"{log_dir}/server_log.json", "w") as f:
-        json.dump(log, f, indent=2)
+    out_path = os.path.join(log_dir, "server_log.json")
+    with open(out_path, "w") as f:
+        json.dump(LOG, f, indent=2)
 
-    print(f"✅ Saved server logs to runs/{sched}/server_log.json")
+    print(f"*** Server stopped, wrote {out_path}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

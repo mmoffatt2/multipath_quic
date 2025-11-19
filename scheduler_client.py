@@ -9,6 +9,7 @@ import sys
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.quic.events import QuicEvent  # for type hinting in protocol
 
 
 LOG = []
@@ -26,61 +27,136 @@ alpha = 0.5
 beta = 0.8
 gamma = 1.2
 
+BASE_WEIGHT = 100_000
 
 class PathState:
     def __init__(self, name, conn, stream_id):
         self.name = name
-        self.conn = conn
+        self.conn = conn          # QuicConnectionProtocol
         self.stream = stream_id
+
+        # RTT / jitter history
         self.rtts = []
+
+        # sequence number of last chunk sent on this path
         self.last_seq = -1
+
+        # sending stats
         self.bytes_sent = 0
+        self.first_send_time = None
+        self.last_send_time = None
+
+        # Used for WRR scheduler
+        self.weight = 1
+        self.current_weight = 0
 
     @property
     def rtt(self):
+        """Smoothed RTT: mean of logged samples, default 30ms if none yet."""
         return sum(self.rtts) / len(self.rtts) if self.rtts else 0.03
 
     @property
     def jitter(self):
+        """Mean absolute difference between consecutive RTTs."""
         if len(self.rtts) < 2:
-            return 0
+            return 0.0
         diffs = [abs(self.rtts[i] - self.rtts[i - 1]) for i in range(1, len(self.rtts))]
         return sum(diffs) / len(diffs)
 
     @property
     def bw(self):
-        # rough proxy for bandwidth: more bytes_sent → more bw
-        return max(1, self.bytes_sent)
+        """
+        Approximate bandwidth as bytes_sent / elapsed_time on this path.
 
-    def log_rtt(self, r):
+        This is not perfect BBR-style delivery-rate (which would need per-ACK
+        byte counts), but it is a *real* time-based send rate for the path.
+        """
+        if self.first_send_time is None:
+            return 1.0  # avoid division by zero before any sends
+
+        end_time = self.last_send_time or time.time()
+        dt = end_time - self.first_send_time
+        if dt <= 0:
+            return float(self.bytes_sent) if self.bytes_sent > 0 else 1.0
+
+        return max(1.0, self.bytes_sent / dt)  # bytes / second
+
+    def log_rtt(self, r: float):
+        """Record a new RTT sample (seconds)."""
         self.rtts.append(r)
 
 
 def score_path(path, other_last_seq):
+    """
+    Predictive cost function for SCHED_PREDICT.
+
+    Lower = better. Combines:
+      - RTT
+      - jitter
+      - inverse bandwidth
+      - reordering penalty
+    """
     pred = path.rtt + alpha * path.jitter + beta * (1 / path.bw)
     reorder_pen = gamma * max(0, path.last_seq - other_last_seq)
     return pred + reorder_pen
 
 
-async def quic_connect(local_ip, server_ip, port=4443):
-    # 1. QUIC config
-    conf = QuicConfiguration(is_client=True, alpn_protocols=["hq-29"])
+class MPQuicProtocol(QuicConnectionProtocol):
+    """
+    Custom protocol that exposes per-path RTT back to PathState.
 
-    # 2. Bind UDP to interface
+    We don't get explicit ACK events from aioquic at the app layer, but every
+    time an event is delivered, the loss-recovery module has up-to-date RTT.
+    We read _loss._latest_rtt and push it into the associated PathState.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # We'll attach path_state *after* construction
+        self.path_state = None
+        super().__init__(*args, **kwargs)
+
+    def quic_event_received(self, event: QuicEvent) -> None:
+        print("GOT EVENT:", event)
+
+        # Continue normal aioquic processing
+        super().quic_event_received(event)
+
+        # Read RTT estimate directly from loss-recovery
+        if self.path_state is not None:
+            loss = self._quic._loss
+            latest_rtt = getattr(loss, "_rtt_latest", None)
+            print("LATEST_RTT:", latest_rtt)
+            if latest_rtt is not None:
+                self.path_state.log_rtt(latest_rtt)
+
+
+async def quic_connect(local_ip, server_ip, port=4443):
+    import ssl  # must import ssl here or at top of file
+
+    # 1. QUIC client configuration
+    conf = QuicConfiguration(
+        is_client=True,
+        alpn_protocols=["hq-29"],
+    )
+
+    # Disable certificate verification (self-signed cert)
+    conf.verify_mode = ssl.CERT_NONE
+
+    # 2. Bind UDP to specific interface / IP
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((local_ip, 0))
 
     # 3. Create low-level QUIC connection
     quic = QuicConnection(configuration=conf)
 
-    # 4. Wrap inside protocol handler
-    protocol = QuicConnectionProtocol(quic)
+    # 4. Wrap inside our custom protocol
+    protocol = MPQuicProtocol(quic)
 
-    # 5. Register with event loop
+    # 5. Register with asyncio event loop
     loop = asyncio.get_event_loop()
     await loop.create_datagram_endpoint(lambda: protocol, sock=sock)
 
-    # 6. Connect + handshake
+    # 6. Connect + kick off handshake
     quic.connect((server_ip, port), now=time.time())
     protocol.transmit()
 
@@ -91,13 +167,23 @@ def open_stream_id(quic):
     try:
         return quic.get_next_available_stream_id(is_unidirectional=False)
     except TypeError:
+        # older aioquic versions have a different signature
         return quic.get_next_available_stream_id()
 
 
-def send_chunk(pstate, stream_id, chunk):
-    # write bytes into a specific stream ID
+def send_chunk(pstate: PathState, stream_id: int, chunk: bytes):
+    """
+    Send a single chunk on the given path / stream.
+    Updates timing needed for bandwidth estimation.
+    """
+    now = time.time()
+    if pstate.first_send_time is None:
+        pstate.first_send_time = now
+    pstate.last_send_time = now
+
     pstate.conn._quic.send_stream_data(stream_id, chunk, end_stream=False)
     pstate.conn.transmit()
+    print(f"SENDING {len(chunk)} bytes on path", pstate.name)
 
 
 async def main(sched=SCHED_PREDICT):
@@ -117,6 +203,13 @@ async def main(sched=SCHED_PREDICT):
     pathA = PathState("A", connA, streamA)
     pathB = PathState("B", connB, streamB)
 
+    # Attach path states to protocols so RTT logging works
+    connA.path_state = pathA
+    connB.path_state = pathB
+
+    print("connA type =", type(connA))
+    print("protocol internal =", connA._quic)
+
     # send scheduler header on both streams
     header = f"SCHED:{sched}".encode()
     pA = pathA.conn._quic
@@ -130,16 +223,32 @@ async def main(sched=SCHED_PREDICT):
     TOTAL = 500
 
     while SEQ < TOTAL:
-        # Fake RTT sampling for now (will replace w/ ACK timing)
-        pathA.log_rtt(random.uniform(0.01, 0.03))
-        pathB.log_rtt(random.uniform(0.03, 0.07))
+        # NOTE: RTT is now populated by MPQuicProtocol.quic_event_received
 
         # Choose scheduler
         if sched == SCHED_MIN_RTT:
             chosen = pathA if pathA.rtt < pathB.rtt else pathB
 
         elif sched == SCHED_WRR:
-            chosen = pathA if random.random() < 0.5 else pathB
+            # Update weights based on estimated bandwidth
+            pathA.weight = max(1, int(pathA.bw / BASE_WEIGHT))
+            pathB.weight = max(1, int(pathB.bw / BASE_WEIGHT))
+
+            total_weight = pathA.weight + pathB.weight
+
+            # Smooth weighted round robin
+            # we add the weight to the running “priority” counter for that path
+            # Fast path accumulates priority quickly (bigger weight)
+            # Slow path accumulates priority slowly (smaller weight)
+            pathA.current_weight += pathA.weight
+            pathB.current_weight += pathB.weight
+
+            # choose heavier
+            chosen = pathA if pathA.current_weight >= pathB.current_weight else pathB
+
+            # decrease chosen path’s current weight by total
+            # resets the chosen path’s priority downward
+            chosen.current_weight -= total_weight
 
         elif sched == SCHED_REDUNDANT:
             send_chunk(pathA, pathA.stream, CHUNK)
@@ -168,7 +277,12 @@ async def main(sched=SCHED_PREDICT):
             scoreB = score_path(pathB, pathA.last_seq)
             chosen = pathA if scoreA < scoreB else pathB
 
-        # send chunk
+        else:
+            # fallback just in case
+            print("*** Unknown scheduler, defaulting to path A ***")
+            chosen = pathA
+
+        # send chunk on chosen path
         send_chunk(chosen, chosen.stream, CHUNK)
         chosen.bytes_sent += len(CHUNK)
         chosen.last_seq = SEQ

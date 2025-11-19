@@ -2,8 +2,10 @@
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.link import TCLink
-from mininet.log import setLogLevel
+from mininet.log import setLogLevel, info
 from mininet.cli import CLI
+from mininet.node import Controller
+import os
 
 class MPTopo(Topo):
     def build(self):
@@ -13,30 +15,46 @@ class MPTopo(Topo):
         s1 = self.addSwitch('s1')
         s2 = self.addSwitch('s2')
 
-        # Path A: low latency
+        # Path A: low-latency
         self.addLink(h1, s1,
             cls=TCLink, bw=8, delay='10ms', jitter='1ms', max_queue_size=20)
         self.addLink(s1, h2,
             cls=TCLink, bw=8, delay='10ms', jitter='1ms', max_queue_size=20)
 
-        # Path B: higher latency but more bandwidth
+        # Path B: high-latency, high-bandwidth
         self.addLink(h1, s2,
             cls=TCLink, bw=20, delay='40ms')
         self.addLink(s2, h2,
             cls=TCLink, bw=20, delay='40ms')
 
 def run():
-    net = Mininet(topo=MPTopo(), link=TCLink, controller=None)
+    net = Mininet(topo=MPTopo(), link=TCLink, controller=Controller)
     net.start()
 
     h1, h2 = net.get('h1', 'h2')
-    print("*** Assigning IPs")
+
+    info("*** Assigning IPs\n")
     h1.setIP("10.0.1.1/24", intf="h1-eth0")
     h2.setIP("10.0.1.2/24", intf="h2-eth0")
+
     h1.setIP("10.0.2.1/24", intf="h1-eth1")
     h2.setIP("10.0.2.2/24", intf="h2-eth1")
 
-    print("*** Mininet ready - run server on h2 and client on h1")
+    # Ensure startup.sh exists in current directory
+    if not os.path.exists("startup.sh"):
+        raise FileNotFoundError("startup.sh not found in current directory!")
+
+    info("*** Running startup script on h1\n")
+    h1.cmd("chmod +x startup.sh")
+    print(h1.cmd(f"HOST={h1.name} ./startup.sh"))
+
+    info("*** Running startup script on h2\n")
+    h2.cmd("chmod +x startup.sh")
+    print(h2.cmd(f"HOST={h2.name} ./startup.sh"))
+
+    info("*** Topology ready - routing configured automatically\n")
+    info("*** Run QUIC server on h2 and client on h1\n")
+
     CLI(net)
     net.stop()
 
