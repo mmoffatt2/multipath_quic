@@ -31,10 +31,12 @@ for sched in SCHEDULERS:
         jitters.append(np.mean(vals))
         labels.append(sched)
 
+os.makedirs("plots", exist_ok=True)
+
 plt.figure(figsize=(6,4))
 plt.bar(labels, jitters)
 plt.ylabel("Average Jitter (sec)")
 plt.title("Client-side Jitter per Scheduler")
 plt.tight_layout()
-plt.savefig("plot_jitter_bar.png", dpi=200)
-print("✅ saved plot_jitter_bar.png")
+plt.savefig("plots/plot_jitter_bar.png", dpi=200)
+print("✅ saved plots/plot_jitter_bar.png")

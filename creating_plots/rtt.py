@@ -26,11 +26,13 @@ for sched in SCHEDULERS:
     y = np.arange(len(rtts))/len(rtts)
     plt.plot(rtts, y, label=sched)
 
+os.makedirs("plots", exist_ok=True)
+
 plt.xlabel("RTT (s)")
 plt.ylabel("CDF")
 plt.title("RTT CDF per Scheduler (client-estimated)")
 plt.legend()
 plt.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig("plot_rtt_cdf.png", dpi=200)
-print("✅ saved plot_rtt_cdf.png")
+plt.savefig("plots/plot_rtt_cdf.png", dpi=200)
+print("✅ saved plots/plot_rtt_cdf.png")

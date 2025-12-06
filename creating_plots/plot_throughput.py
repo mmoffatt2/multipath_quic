@@ -51,14 +51,16 @@ def main():
         if times:
             plt.plot(times, thr, label=sched)
 
+    os.makedirs("plots", exist_ok=True)
+    
     plt.title("Client Throughput Over Time")
     plt.xlabel("Time (sec)")
     plt.ylabel("Throughput (bytes/sec)")
     plt.grid(True, linestyle="--", alpha=0.4)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("throughput_timeseries.png")
-    print("✅ Saved throughput_timeseries.png")
+    plt.savefig("plots/throughput_timeseries.png")
+    print("✅ Saved plots/throughput_timeseries.png")
 
 
 if __name__ == "__main__":
