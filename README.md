@@ -1,9 +1,12 @@
 Setup virtual env:
 
-    python3 -m venv venv
+    python3 -m venv venv <n> # where n is a number from 1-4
+
+    source venv/bin/activate
     
     pip install -r requirements.txt
 
+Use Mininet VM for future steps:
 
 Run schedulers:
 
